@@ -11,9 +11,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 from transformers import AdamW, GPT2Tokenizer, GPT2LMHeadModel
 from tokenizers import BertWordPieceTokenizer
-from data_readers import filter_dataset, GPTDataset, NextActionDataset, NextActionSchema, ResponseGenerationDataset
+from data_readers import filter_dataset, get_entities, GPTDataset, NextActionDataset, NextActionSchema, ResponseGenerationDataset
 from models import ActionBertModel, SchemaActionBertModel
 from sklearn.metrics import f1_score
+from nltk.translate.bleu_score import corpus_bleu
+from sklearn.preprocessing import MultiLabelBinarizer
 
 def read_args():
     parser = argparse.ArgumentParser()
@@ -38,6 +40,26 @@ def read_args():
     parser.add_argument("--max_grad_norm", default=-1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+def id_em(pred, true):
+    common = ['hello, how can i help?', 'thank you and goodbye.', 'is there anything else that i can do for you?']
+    arr = [p==t for p,t in zip(pred,true) if t.lower() not in common]
+    exact_match = sum(arr)/len(arr)
+    return exact_match
+
+entities = get_entities()
+mlb = MultiLabelBinarizer()
+mlb.fit([[e] for e in entities])
+def entity_f1(pred, true):
+    def _get_ents(arr):
+        ents = []
+        for utt in arr:
+            ents.append([ent for ent in entities if ent in utt])
+        return ents
+
+    pred_ents = mlb.transform(_get_ents(pred))
+    true_ents = mlb.transform(_get_ents(true))
+    return f1_score(pred_ents, true_ents, average='weighted')
 
 def get_topk_actions(model,
                      eval_dataloader,
@@ -85,13 +107,11 @@ def get_topk_actions(model,
                                                  sc_pooled_output=sc_pooled_output,
                                                  sc_tasks=sc_tasks,
                                                  sc_action_label=sc_action_label)
+                # Argmax to get predictions
+                action_preds = torch.topk(action_logits, k=3, dim=1)[1].tolist()
             else:
-                action_logits, _ = model(input_ids=batch["input_ids"],
-                                         attention_mask=batch["attention_mask"],
-                                         token_type_ids=batch["token_type_ids"])
+                action_preds = [0] * len(batch["history"])
 
-            # Argmax to get predictions
-            action_preds = torch.topk(action_logits, k=3, dim=1)[1].tolist()
 
             pred += action_preds
             histories += batch["history"]
@@ -108,7 +128,7 @@ def evaluate(model,
              device=0,
              args=None): 
     # Get schema pooled outputs
-    if args.use_schema:
+    if args.use_schema and task == "action":
         with torch.no_grad():    
             sc_batch = next(iter(schema_dataloader))
             if torch.cuda.is_available():
@@ -129,15 +149,15 @@ def evaluate(model,
     true = []
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         with torch.no_grad():
-            # Move to GPU
-            if torch.cuda.is_available():
-                for key, val in batch.items():
-                    if type(batch[key]) is list:
-                        continue
-
-                    batch[key] = batch[key].to(device)
-
             if task == "action":
+                # Move to GPU
+                if torch.cuda.is_available():
+                    for key, val in batch.items():
+                        if type(batch[key]) is list:
+                            continue
+
+                        batch[key] = batch[key].to(device)
+
                 if args.use_schema:
                     action_logits, _ = model.predict(input_ids=batch["input_ids"],
                                                      attention_mask=batch["attention_mask"],
@@ -156,6 +176,28 @@ def evaluate(model,
 
                 pred += action_preds
                 true += batch["action"].cpu().tolist()
+            elif task == "generation":
+                batch = batch.to(device)
+
+                # Find start index
+                st_ind = 2257
+                start_ind = batch[0].tolist().index(2257)+3
+                input_batch = batch[:,:start_ind]
+
+                generated = model.generate(input_batch, max_length=start_ind + 50)
+
+                def _get_outputs(ids):
+                    words = tokenizer.decode(ids[0].tolist()).split()
+                    start_ind = words.index("[START]") if "[START]" in words else 0
+                    end_ind = words.index("[END]") if "[END]" in words else -1
+                    output = " ".join(words[start_ind+1:end_ind])
+                    return output
+
+                generated_output = _get_outputs(generated)
+                true_output = _get_outputs(batch)
+
+                pred.append(generated_output)
+                true.append(true_output)
 
     # Perform evaluation
     if task == "action":
@@ -163,6 +205,14 @@ def evaluate(model,
         f1 = f1_score(true, pred, average='weighted')
         print(acc, f1)
         return f1
+    elif task == "generation":
+        #exact_match = sum([p==t for p,t in zip(pred,true)])/len(true)
+        bleu = corpus_bleu([[t.split()] for t in true], [p.split() for p in pred], weights=(0,0,0,1.0))
+        id_exact_match = id_em(pred, true)
+        ef1 = entity_f1(pred,true)
+
+        print(bleu, id_exact_match, ef1)
+        return bleu, id_exact_match, ef1
 
 def train(args, exp_setting=None):
     # Set random seed
@@ -176,7 +226,8 @@ def train(args, exp_setting=None):
         # This means we're evaluating. Don't create the directory.
         pass
     else:
-        raise Exception("Directory {} already exists".format(args.output_dir))
+        args.num_epochs = 0
+        #raise Exception("Directory {} already exists".format(args.output_dir))
 
     # Dump arguments to the checkpoint directory, to ensure reproducability.
     if args.num_epochs > 0:
@@ -312,7 +363,8 @@ def train(args, exp_setting=None):
 
         gpt_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         gpt_model = GPT2LMHeadModel.from_pretrained("gpt2")
-
+        gpt_tokenizer.add_special_tokens({'pad_token': '[PAD]', 'sep_token': '[SEP]'})
+        gpt_model.resize_token_embeddings(len(gpt_tokenizer))
         if torch.cuda.is_available():
             action_model.to(args.device)
             gpt_model.to(args.device)
@@ -321,24 +373,32 @@ def train(args, exp_setting=None):
 
 
     if args.task == "generation":
-        # Load action model
-        action_model.load_state_dict(torch.load(os.path.join(args.action_output_dir, "model.pt")))
+        if args.use_schema:
+            # Load action model
+            action_model.load_state_dict(torch.load(os.path.join(args.action_output_dir, "model.pt")))
 
-        # Generate actions for both the train and test set
-        train_preds, train_histories, train_responses = get_topk_actions(action_model, train_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
-        test_preds, test_histories, test_responses = get_topk_actions(action_model, test_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
+            # Generate actions for both the train and test set
+            train_preds, train_histories, train_responses = get_topk_actions(action_model, train_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
+            test_preds, test_histories, test_responses = get_topk_actions(action_model, test_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
 
-        # Convert preds to responses. If the schema does not contain the action - reply mapping, use the name of the action instead 
-        # Eventually this should be manually fixed in the schema.
-        actions = sorted(action_label_to_id, key=action_label_to_id.get)
-        train_preds = [
-            "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
-            for pred in train_preds
-        ]
-        test_preds = [
-            "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
-            for pred in test_preds
-        ]
+            # Convert preds to responses. If the schema does not contain the action - reply mapping, use the name of the action instead 
+            # Eventually this should be manually fixed in the schema.
+            actions = sorted(action_label_to_id, key=action_label_to_id.get)
+            train_preds = [
+                "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
+                for pred in train_preds
+            ]
+            test_preds = [
+                "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
+                for pred in test_preds
+            ]
+        else:
+            # Doesn't actually run action prediction
+            _, train_histories, train_responses = get_topk_actions(action_model, train_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
+            _, test_histories, test_responses = get_topk_actions(action_model, test_dataloader, schema_test_dataloader, tokenizer, task=args.task, args=args)
+
+            train_preds = [""]*len(train_histories)
+            test_preds = [""]*len(test_histories)
 
 
         train_dataset = GPTDataset(tokenizer=gpt_tokenizer, 
@@ -352,16 +412,20 @@ def train(args, exp_setting=None):
                                   pred_responses=test_preds)
 
         train_dataloader = DataLoader(dataset=train_dataset,
-                                      batch_size=4,
+                                      batch_size=8,
                                       shuffle=True)
 
         test_dataloader = DataLoader(dataset=test_dataset,
                                      batch_size=1,
                                      pin_memory=True)
 
-        optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
-        for epoch in range(EPOCHS):
+        optimizer = AdamW(gpt_model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
+        model = gpt_model
+        tokenizer = gpt_tokenizer
+        for epoch in trange(args.num_epochs, desc="Epoch"):
+            gpt_model.train()
             epoch_loss = 0
+            num_batches = 0
             for batch in tqdm(train_dataloader):
                 outputs = gpt_model(batch.to(args.device), labels=batch.to(args.device))
         
@@ -369,8 +433,9 @@ def train(args, exp_setting=None):
                 loss.backward()
 
                 epoch_loss += loss.item()
+                num_batches += 1
                 optimizer.step()
-                model.zero_grad()
+                gpt_model.zero_grad()
 
             print("Epoch loss: {}".format(epoch_loss / num_batches))
 
@@ -475,30 +540,48 @@ if __name__ == "__main__":
     domains = ['ride', 'trip', 'plane', 'spaceship', 'meeting', 'weather', 'party', 'doctor', 'trivia', 'apartment', 'restaurant', 'hotel', 'bank']
     tasks = ['hotel_service_request', 'bank_balance', 'weather', 'bank_fraud_report', 'party_rsvp', 'apartment_search', 'trivia', 'ride_book', 'apartment_schedule', 'hotel_book', 'ride_status', 'restaurant_search', 'doctor_schedule', 'doctor_followup', 'restaurant_book', 'plane_search', 'meeting_schedule', 'spaceship_life_support', 'party_plan', 'plane_book', 'spaceship_access_codes', 'hotel_search', 'trip_directions']
 
-    #scores = []
-    #for domain in domains:
-    #    print("DOMAIN", domain)
-    #    exp_setting = {"domain": domain, "data_type": "unhappy"}
+    scores = []
+    for domain in domains:
+        print("DOMAIN", domain)
+        exp_setting = {"domain": domain, "data_type": "happy"}
 
-    #    args.output_dir = args.output_dir + domain + "/"
+        args.action_output_dir = args.action_output_dir + domain + "/"
+        args.output_dir = args.output_dir + domain + "/"
 
-    #    scores.append(train(args, exp_setting))
-    #    print(scores)
-    #    print(np.mean(scores))
+        scores.append(train(args, exp_setting))
+        print(scores)
+        print(np.mean(scores))
 
-    exp_setting = {"data_type": "happy"}
-    score = train(args, exp_setting)
-    print(score)
+    #exp_setting = {"data_type": "multitask"}
+    #score = train(args, exp_setting)
+    #print(score)
 
 
-    #scores = []
-    #for task in tasks:
+    scores = []
+    #old_scores = [(0.1251822880329993, 0.008695652173913044, 0.4422287223225904), (0.2030153366259423, 0.2334293948126801, 0.5154030787129109), (0.09997489644784736, 0.03586321934945788, 0.524756762789609), (0.13554532880138379, 0.055315471045808126, 0.5218483431511356), (0.12952421111813903, 0.043560606060606064, 0.5096936399549333), (0.06351615001083892, 0.025806451612903226, 0.2910344199776204), (0.013483511127957976, 0.0057684384013185, 0.32428577205905135), (0.2229493128323843, 0.03289473684210526, 0.5159379065636661)]
+    #old_scores = [(0.13810549037760272, 0.002898550724637681, 0.5338795693511099), (0.2403602589361103, 0.23631123919308358, 0.483329522331328), (0.09254531529231554, 0.041701417848206836, 0.33598698870880594), (0.1554872000833363, 0.14001728608470182, 0.5034600823266697), (0.12799401197604787, 0.026515151515151516, 0.4804521855742575), (0.018745357409085013, 0.0, 0.2661509871806041), (0.005401486362824454, 0.0, 0.3822273025173828), (0.14336143657089925, 0.027046783625730993, 0.537998560369733)]
+
+
+    old_scores = []
+
+
+    #for i,task in enumerate(tasks):
     #    print("TASK", task)
-    #    exp_setting = {"task": task, "data_type": "happy"}
+    #    exp_setting = {"task": task, "data_type": "unhappy"}
 
+    #    args.action_output_dir = args.action_output_dir + task + "/"
     #    args.output_dir = args.output_dir + task + "/"
 
-    #    scores.append(train(args, exp_setting))
+    #    if i < len(old_scores):
+    #        scores.append(old_scores[i])
+    #    else:
+    #        scores.append(train(args, exp_setting))
     #    print(scores)
-    #    print(np.mean(scores))
+
+    #    if args.task == "generation":
+    #        print(np.mean([e[0] for e in scores]))
+    #        print(np.mean([e[1] for e in scores]))
+    #        print(np.mean([e[2] for e in scores]))
+    #    else:
+    #        print(np.mean(scores))
     #print(np.mean(scores))

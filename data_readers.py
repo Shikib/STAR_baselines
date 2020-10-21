@@ -3,10 +3,28 @@ import json
 import numpy as np
 import os
 import pickle
+import torch
 
-from tokenizers import BertWordPieceTokenizer
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+def get_entities(path="STAR/dialogues/"):
+    # Load conversations
+    convs = [json.load(open(path+fn)) for fn in os.listdir(path)]
+    entities = []
+    for conv in convs:
+        for event in conv['Events']:
+            if 'PrimaryItem' not in event:
+                continue
+
+            for entity in event['PrimaryItem'].values():
+                if type(entity) is list:
+                    entities += entity
+                else:
+                    entities.append(entity)
+
+    entities = list(set([str(e) for e in entities]))
+    return entities
 
 def filter_dataset(dataset,
                    data_type="happy", # happy, unhappy, multitask
@@ -378,10 +396,12 @@ class GPTDataset(Dataset):
     ):
         self.examples = []
 
-        for history, response, pred_response in zip(histories, responses, pred_responses):
+        for history, response, pred_response in tqdm(zip(histories, responses, pred_responses)):
             # Consider only portions of each input (for a total of 512)
-            tokenized = tokenizer.encode(history)[-200:] + tokenizer.encode(pred_response) + tokenizer.encode("[START] " + response + " [END]")
-            self.examples.append(tokenized[-block_size:])
+            example = " ".join(history.split()[-200:]) + " " + pred_response + " [START] " + response + " [END]"
+            example = " ".join(example.split())
+            tokenized = tokenizer(example, padding="max_length", max_length=400)
+            self.examples.append(tokenized['input_ids'][-400:])
 
     def __len__(self):
         return len(self.examples)
