@@ -79,9 +79,9 @@ def get_topk_actions(model,
 
                     sc_batch[key] = sc_batch[key].to(device)
 
-            sc_pooled_output = model.bert_model(input_ids=sc_batch["input_ids"],
+            sc_all_output, sc_pooled_output = model.bert_model(input_ids=sc_batch["input_ids"],
                                                 attention_mask=sc_batch["attention_mask"],
-                                                token_type_ids=sc_batch["token_type_ids"])[1]
+                                                token_type_ids=sc_batch["token_type_ids"])
             sc_action_label = sc_batch["action"]
             sc_tasks = sc_batch["task"]
 
@@ -105,10 +105,12 @@ def get_topk_actions(model,
                                                  token_type_ids=batch["token_type_ids"],
                                                  tasks=batch["tasks"],
                                                  sc_pooled_output=sc_pooled_output,
+                                                 sc_all_output=sc_all_output,
                                                  sc_tasks=sc_tasks,
-                                                 sc_action_label=sc_action_label)
+                                                 sc_action_label=sc_action_label,
+                                                 sc_full_graph=schema_dataloader.dataset.full_graph)
                 # Argmax to get predictions
-                action_preds = torch.topk(action_logits, k=3, dim=1)[1].tolist()
+                action_preds = torch.topk(action_logits, k=1, dim=1)[1].tolist()
             else:
                 action_preds = [0] * len(batch["history"])
 
@@ -138,15 +140,16 @@ def evaluate(model,
 
                     sc_batch[key] = sc_batch[key].to(device)
 
-            sc_pooled_output = model.bert_model(input_ids=sc_batch["input_ids"],
+            sc_all_output, sc_pooled_output = model.bert_model(input_ids=sc_batch["input_ids"],
                                                 attention_mask=sc_batch["attention_mask"],
-                                                token_type_ids=sc_batch["token_type_ids"])[1]
+                                                token_type_ids=sc_batch["token_type_ids"])
             sc_action_label = sc_batch["action"]
             sc_tasks = sc_batch["task"]
 
-    model.eval()
     pred = []
     true = []
+    sentence = []
+    model.eval()
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         with torch.no_grad():
             if task == "action":
@@ -163,9 +166,11 @@ def evaluate(model,
                                                      attention_mask=batch["attention_mask"],
                                                      token_type_ids=batch["token_type_ids"],
                                                      tasks=batch["tasks"],
+                                                     sc_all_output=sc_all_output,
                                                      sc_pooled_output=sc_pooled_output,
                                                      sc_tasks=sc_tasks,
-                                                     sc_action_label=sc_action_label)
+                                                     sc_action_label=sc_action_label,
+                                                     sc_full_graph=schema_dataloader.dataset.full_graph)
                 else:
                     action_logits, _ = model(input_ids=batch["input_ids"],
                                              attention_mask=batch["attention_mask"],
@@ -176,6 +181,7 @@ def evaluate(model,
 
                 pred += action_preds
                 true += batch["action"].cpu().tolist()
+                sentence += [tokenizer.decode(e.tolist(), skip_special_tokens=False).replace(" [PAD]", "") for e in batch["input_ids"]]
             elif task == "generation":
                 batch = batch.to(device)
 
@@ -204,7 +210,20 @@ def evaluate(model,
         acc = sum(p == t for p,t in zip(pred, true))/len(pred)
         f1 = f1_score(true, pred, average='weighted')
         print(acc, f1)
-        return f1
+
+        id_map = eval_dataloader.dataset.action_label_to_id
+        label_map = sorted(id_map, key=id_map.get)
+        print("INCORRECT ==========================================================")
+        for i in range(len(true)):
+            if pred[i] != true[i]:
+                print(sentence[i] + "\n", label_map[true[i]], label_map[pred[i]])
+        print("CORRECT ==========================================================")
+        for i in range(len(true)):
+            if pred[i] == true[i]:
+                print(sentence[i] + "\n", label_map[true[i]], label_map[pred[i]])
+
+
+        return f1, acc
     elif task == "generation":
         #exact_match = sum([p==t for p,t in zip(pred,true)])/len(true)
         bleu = corpus_bleu([[t.split()] for t in true], [p.split() for p in pred], weights=(0,0,0,1.0))
@@ -226,8 +245,8 @@ def train(args, exp_setting=None):
         # This means we're evaluating. Don't create the directory.
         pass
     else:
-        args.num_epochs = 0
-        #raise Exception("Directory {} already exists".format(args.output_dir))
+        #args.num_epochs = 0
+        raise Exception("Directory {} already exists".format(args.output_dir))
 
     # Dump arguments to the checkpoint directory, to ensure reproducability.
     if args.num_epochs > 0:
@@ -257,6 +276,7 @@ def train(args, exp_setting=None):
                                   tokenizer,
                                   args.max_seq_length,
                                   token_vocab_name)
+    #dataset.examples = [e for e in dataset if 'weather' in e['tasks']]
 
     # Get the action to id mapping
     if args.task == "generation":
@@ -319,13 +339,14 @@ def train(args, exp_setting=None):
                               token_vocab_name)
 
     # Data loaders
+    train_dataset.examples = sorted(train_dataset.examples, key=lambda i:i['tasks'])
     train_dataloader = DataLoader(dataset=train_dataset,
                                   batch_size=args.train_batch_size,
-                                  shuffle=True,
+                                  shuffle=False,
                                   num_workers=0)
 
     schema_train_dataloader = DataLoader(dataset=schema,
-                                         batch_size=args.train_batch_size,
+                                         batch_size=min(len(schema), args.train_batch_size),
                                          pin_memory=True,
                                          shuffle=True)
 
@@ -337,6 +358,10 @@ def train(args, exp_setting=None):
     test_dataloader = DataLoader(dataset=test_dataset,
                                  batch_size=args.train_batch_size,
                                  pin_memory=True)
+
+    print("Training set size", len(train_dataloader.dataset))
+    print("Testing set size", len(test_dataloader.dataset))
+    print("Experimental Setting", exp_setting)
 
     # Load model
     if args.task == "action":
@@ -384,10 +409,21 @@ def train(args, exp_setting=None):
             # Convert preds to responses. If the schema does not contain the action - reply mapping, use the name of the action instead 
             # Eventually this should be manually fixed in the schema.
             actions = sorted(action_label_to_id, key=action_label_to_id.get)
+            #train_preds = ["[PRED] " + schema.action_to_response[action_label_to_id[e['action']]] for e in train_dataloader.dataset ]
+            train_preds = [action_label_to_id[e['action']] for e in train_dataloader.dataset]
+            ignore_inds = set([i for i,e in enumerate(train_preds) if e not in schema.action_to_response])
+
             train_preds = [
-                "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
-                for pred in train_preds
-            ]
+                "[PRED] " + schema.action_to_response[p] for i,p in enumerate(train_preds) if i not in ignore_inds]
+            
+
+            train_histories = [e for i,e in enumerate(train_histories) if i not in ignore_inds]
+            train_responses = [e for i,e in enumerate(train_responses) if i not in ignore_inds]
+
+            #train_preds = [
+            #    "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
+            #    for pred in train_preds
+            #]
             test_preds = [
                 "[PRED] " + " [PRED] ".join([schema.action_to_response.get(p, actions[p]) for p in pred])
                 for pred in test_preds
@@ -412,7 +448,7 @@ def train(args, exp_setting=None):
                                   pred_responses=test_preds)
 
         train_dataloader = DataLoader(dataset=train_dataset,
-                                      batch_size=8,
+                                      batch_size=args.train_batch_size,
                                       shuffle=True)
 
         test_dataloader = DataLoader(dataset=test_dataset,
@@ -430,23 +466,35 @@ def train(args, exp_setting=None):
                 outputs = gpt_model(batch.to(args.device), labels=batch.to(args.device))
         
                 loss, logits = outputs[:2]                        
+
+                if args.grad_accum > 1:
+                    loss = loss / args.grad_accum
+
                 loss.backward()
+
+                if args.grad_accum <= 1 or num_batches % args.grad_accum == 0:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(gpt_model.parameters(), args.max_grad_norm)
+
+                    optimizer.step()
+                    gpt_model.zero_grad()
 
                 epoch_loss += loss.item()
                 num_batches += 1
-                optimizer.step()
-                gpt_model.zero_grad()
 
             print("Epoch loss: {}".format(epoch_loss / num_batches))
 
     elif args.task == "action":
         optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
         best_score = -1
+
+        model.tokenizer = tokenizer
         for epoch in trange(args.num_epochs, desc="Epoch"):
             model.train()
             epoch_loss = 0
             num_batches = 0
 
+            model.zero_grad()
             for batch in tqdm(train_dataloader): 
                 num_batches += 1
 
@@ -467,18 +515,19 @@ def train(args, exp_setting=None):
                     relevant_inds = []
                     batch_actions = set(batch['action'].tolist())
                     batch_tasks = set(batch['tasks'][0])
+                    batch_action_tasks = [(batch['action'][i].item(), batch['tasks'][i]) for i in range(len(batch['action']))]
                     for i,action in enumerate(sc_batch['action'].tolist()):
-                        if action in batch_actions:
+                        if (action, sc_batch['task'][i]) in batch_action_tasks:
                             relevant_inds.append(i)
-                            batch_actions.remove(action)
+                            #batch_actions.remove(action)
 
                     # Add random inds until we hit desired batch size
-                    while len(relevant_inds) < 64:
-                        ind = random.randint(0, len(sc_batch['task'])-1)
-                        if ind in relevant_inds: 
-                            continue
+                    #while len(relevant_inds) < min(len(schema), 64):
+                    #    ind = random.randint(0, len(sc_batch['task'])-1)
+                    #    if ind in relevant_inds: 
+                    #        continue
 
-                        relevant_inds.append(ind)
+                    #    relevant_inds.append(ind)
 
                     # Filter out sc batch to only relevant inds
                     sc_batch = {
@@ -502,7 +551,8 @@ def train(args, exp_setting=None):
                                     sc_attention_mask=sc_batch["attention_mask"],
                                     sc_token_type_ids=sc_batch["token_type_ids"],
                                     sc_tasks=sc_batch["task"],
-                                    sc_action_label=sc_batch["action"])
+                                    sc_action_label=sc_batch["action"],
+                                    sc_full_graph=schema.full_graph)
                 else:
                     _, loss = model(input_ids=batch["input_ids"],
                                     attention_mask=batch["attention_mask"],
@@ -538,23 +588,26 @@ if __name__ == "__main__":
     print(args)
 
     domains = ['ride', 'trip', 'plane', 'spaceship', 'meeting', 'weather', 'party', 'doctor', 'trivia', 'apartment', 'restaurant', 'hotel', 'bank']
-    tasks = ['hotel_service_request', 'bank_balance', 'weather', 'bank_fraud_report', 'party_rsvp', 'apartment_search', 'trivia', 'ride_book', 'apartment_schedule', 'hotel_book', 'ride_status', 'restaurant_search', 'doctor_schedule', 'doctor_followup', 'restaurant_book', 'plane_search', 'meeting_schedule', 'spaceship_life_support', 'party_plan', 'plane_book', 'spaceship_access_codes', 'hotel_search', 'trip_directions']
+    tasks = ['hotel_service_request', 'bank_balance', 'weather', 'bank_fraud_report', 'party_rsvp', 'apartment_search', 'trivia', 'ride_book', 'apartment_schedule', 'hotel_book', 'ride_status', 'restaurant_search', 'doctor_schedule', 'doctor_followup', 'restaurant_book', 'plane_search', 'meeting_schedule',  'party_plan', 'plane_book', 'spaceship_access_codes', 'hotel_search', 'trip_directions']
 
-    scores = []
-    for domain in domains:
-        print("DOMAIN", domain)
-        exp_setting = {"domain": domain, "data_type": "happy"}
+    # TODO: removed spaceship lifesupport
 
-        args.action_output_dir = args.action_output_dir + domain + "/"
-        args.output_dir = args.output_dir + domain + "/"
+    #scores = []
+    #for domain in domains:
+    #    print("DOMAIN", domain)
+    #    exp_setting = {"domain": domain, "data_type": "happy"}
 
-        scores.append(train(args, exp_setting))
-        print(scores)
-        print(np.mean(scores))
+    #    args.action_output_dir = args.action_output_dir + domain + "/"
+    #    args.output_dir = args.output_dir + domain + "/"
 
-    #exp_setting = {"data_type": "multitask"}
+    #    scores.append(train(args, exp_setting))
+    #    print(scores)
+    #    print(np.mean(scores))
+
+    #exp_setting = {"data_type": "happy"}
     #score = train(args, exp_setting)
     #print(score)
+    #import pdb; pdb.set_trace()
 
 
     scores = []
@@ -562,26 +615,42 @@ if __name__ == "__main__":
     #old_scores = [(0.13810549037760272, 0.002898550724637681, 0.5338795693511099), (0.2403602589361103, 0.23631123919308358, 0.483329522331328), (0.09254531529231554, 0.041701417848206836, 0.33598698870880594), (0.1554872000833363, 0.14001728608470182, 0.5034600823266697), (0.12799401197604787, 0.026515151515151516, 0.4804521855742575), (0.018745357409085013, 0.0, 0.2661509871806041), (0.005401486362824454, 0.0, 0.3822273025173828), (0.14336143657089925, 0.027046783625730993, 0.537998560369733)]
 
 
+    #old_scores = [0.370145609907578, 0.6936094742462428, 0.5733870590228247, 0.45211109471009503, 0.37460121412747927, 0.38071057973117794, 0.3757033547898641, 0.4347140329420736, 0.560474140681303]
+    #old_scores = [0.4181504089603669, 0.6665471093947086, 0.628755986954502, 0.3765951990641796, 0.42640688701075397, 0.3308334938135245]
+    #old_scores = [0.3055877654220461, 0.52494652771303, 0.5458386347906655, 0.43991664511573825, 0.24908908018826842, 0.25510913052932116, 0.15745862252990223, 0.06364949767977886, 0.3060432849050964, 0.5046084486467972, 0.48505465068648285, 0.44144129710330693, 0.39130821002152216]
+
+    #old_scores = [0.37390275848779864, 0.5919105079512341, 0.5552268398963037, 0.4326607236595678, 0.2826485909464619, 0.30522023576371404, 0.11256835957894906, 0.24244531003723505, 0.40038272491291355, 0.5382107311640719, 0.44551830900005107, 0.4227847203142083, 0.46961304936006326, 0.7538503411190403, 0.45100884710050376, 0.33314844218625644, 0.5343383933970168, 0.5408618827576072, 0.6387976672887278, 0.5575414172950797]
+
+    #old_scores = [0.4627303097385849, 0.6657940755842202, 0.45476291060702423, 0.48067097820820065, 0.4356467356080915, 0.4544275471482722, 0.46795481359900093, 0.5930224296927255, 0.6201425111328526, 0.5541689558045297, 0.536076750710897, 0.25711207213338994, 0.6209493174497825, 0.7144009623569185, 0.5585668878580609, 0.49326759419712946]
+    #old_scores = [0.5053615185098657, 0.6747939031969111, 0.5906308038966452, 0.6054052219734716, 0.49193551441139766]
+    #old_scores = [0.13091714163142734, 0.05936899081061183, 0.23842181459317163, 0.1632424215180666, 0.2505202563791628, 0.33738299841839703, 0.18259675430705485, 0.021114744240237536, 0.8193427790094152, 0.2522276037804978, 0.3190781612117253, 0.2851415637548379, 0.2672976920651196]
     old_scores = []
 
 
-    #for i,task in enumerate(tasks):
-    #    print("TASK", task)
-    #    exp_setting = {"task": task, "data_type": "unhappy"}
+    #old_scores = [(0.47027603689589903, 0.48284313725490197), (0.438210718298963, 0.4860759493670886), (0.627604402070792, 0.6735751295336787), (0.5985664296132878, 0.5810055865921788), (0.31238035757550753, 0.32870771899392887), (0.42882991026213535, 0.5365079365079365), (0.4719889081464009, 0.5240474703310432), (0.5105024721363549, 0.5308219178082192), (0.24318212769144956, 0.31970260223048325), (0.5974995098743199, 0.6113821138211382), (0.5539429856503028, 0.6178861788617886), (0.4276582765053761, 0.4119318181818182), (0.6339501413534022, 0.7003610108303249), (0.7073728649261628, 0.7276995305164319), (0.5907700122606176, 0.5786163522012578), (0.5319049080103434, 0.5545977011494253)]
 
-    #    args.action_output_dir = args.action_output_dir + task + "/"
-    #    args.output_dir = args.output_dir + task + "/"
+    
+    orig_dir = args.action_output_dir
+    orig_output_dir = args.output_dir
+    for i,task in enumerate(domains):
+        print("TASK", task)
+        exp_setting = {"domain": task, "data_type": "happy"}
 
-    #    if i < len(old_scores):
-    #        scores.append(old_scores[i])
-    #    else:
-    #        scores.append(train(args, exp_setting))
-    #    print(scores)
+        args.action_output_dir = orig_dir + task + "/"
+        args.output_dir = orig_output_dir + task + "/"
 
-    #    if args.task == "generation":
-    #        print(np.mean([e[0] for e in scores]))
-    #        print(np.mean([e[1] for e in scores]))
-    #        print(np.mean([e[2] for e in scores]))
-    #    else:
-    #        print(np.mean(scores))
+        if i < len(old_scores):
+            scores.append(old_scores[i])
+        else:
+            scores.append(train(args, exp_setting))
+        print(scores)
+
+        if args.task == "generation":
+            print(np.mean([e[0] for e in scores]))
+            print(np.mean([e[1] for e in scores]))
+            print(np.mean([e[2] for e in scores]))
+        else:
+            print("f1", np.mean([e[0] for e in scores]))
+            print("acc", np.mean([e[1] for e in scores]))
+
     #print(np.mean(scores))
